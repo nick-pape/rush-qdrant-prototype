@@ -1,47 +1,32 @@
-//! Filesystem watcher for incremental re-indexing
-//!
-//! Watches catalog directories for file changes and triggers
-//! incremental re-indexing when modifications are detected.
+//! Filesystem watcher for incremental re-indexing via hosted API.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use notify::{Watcher, RecursiveMode, Event, EventKind};
 
+use crate::api_client::ApiClient;
 use crate::engine::config::should_skip_path;
 use crate::engine::chunker::chunk_file;
-use crate::engine::HttpEmbedder;
-use crate::engine::QdrantUploader;
-use crate::engine::util;
 use crate::{CatalogConfig, is_text_file, chrono_timestamp};
 
-/// Statistics from an incremental crawl
 pub struct CrawlStats {
     pub new_files: usize,
     pub changed_files: usize,
     pub unchanged_files: usize,
     pub deleted_files: usize,
-    pub chunks_embedded: usize,
+    pub chunks_ingested: usize,
 }
 
-/// Run an incremental crawl for a single catalog
 pub fn run_incremental_crawl(
     catalog_name: &str,
     catalog_config: &CatalogConfig,
-    embedder: &HttpEmbedder,
-    collection: &str,
-    qdrant_url: Option<&str>,
-    qdrant_api_key: Option<&str>,
-    vector_size: usize,
+    client: &ApiClient,
 ) -> anyhow::Result<CrawlStats> {
     let directory = &catalog_config.path;
-    let uploader = QdrantUploader::new(collection, qdrant_url, qdrant_api_key, vector_size)?;
 
-    // Get existing files from Qdrant
-    let existing_files = uploader.get_catalog_files(catalog_name)?;
+    let existing_files = client.get_catalog_files(catalog_name)?;
 
-    // Scan directory
     let mut files_to_process: Vec<(String, String)> = Vec::new();
     for entry in walkdir::WalkDir::new(directory)
         .into_iter()
@@ -65,7 +50,7 @@ pub fn run_incremental_crawl(
     let mut new_count = 0;
     let mut changed_count = 0;
     let mut unchanged_count = 0;
-    let mut all_chunks: Vec<crate::engine::Chunk> = Vec::new();
+    let mut total_ingested = 0;
 
     for (file_path, rel_path) in &files_to_process {
         let content = match std::fs::read_to_string(file_path) {
@@ -83,7 +68,7 @@ pub fn run_incremental_crawl(
                 unchanged_count += 1;
                 continue;
             }
-            uploader.delete_file(rel_path, catalog_name)?;
+            client.delete_file(catalog_name, rel_path)?;
             changed_count += 1;
         } else {
             new_count += 1;
@@ -102,60 +87,37 @@ pub fn run_incremental_crawl(
 
         match chunk_file(file_path, catalog_name, directory, &package_name, 6000) {
             Ok(chunks) => {
-                for mut chunk in chunks {
-                    chunk.breadcrumb = chunk.breadcrumb.replace(":[fallback-split]", "");
-                    all_chunks.push(chunk);
+                let chunks: Vec<_> = chunks
+                    .into_iter()
+                    .map(|mut c| {
+                        c.breadcrumb = c.breadcrumb.replace(":[fallback-split]", "");
+                        c
+                    })
+                    .collect();
+                match client.ingest(&chunks) {
+                    Ok(n) => total_ingested += n,
+                    Err(e) => {
+                        eprintln!(
+                            "[{}] Warning: ingest failed for {}: {}",
+                            chrono_timestamp(), file_path, e
+                        );
+                    }
                 }
             }
             Err(e) => {
                 eprintln!(
                     "[{}] Warning: failed to chunk {}: {}",
-                    chrono_timestamp(),
-                    file_path,
-                    e
+                    chrono_timestamp(), file_path, e
                 );
             }
         }
     }
 
-    // Delete orphaned files
     let mut deleted_count = 0;
     for (rel_path, _) in existing_files.iter() {
         if !rel_files_set.contains(rel_path) {
-            uploader.delete_file(rel_path, catalog_name)?;
+            client.delete_file(catalog_name, rel_path)?;
             deleted_count += 1;
-        }
-    }
-
-    // Embed via HTTP API and upload
-    let total_chunks = all_chunks.len();
-    if total_chunks > 0 {
-        let mut file_chunks: HashMap<String, usize> = HashMap::new();
-        let mut file_expected: HashMap<String, usize> = HashMap::new();
-
-        for batch in all_chunks.chunks(32) {
-            let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
-            let embeddings = embedder.embed_batch(&texts)?;
-
-            let embedded: Vec<(crate::engine::Chunk, Vec<f32>)> = batch
-                .iter()
-                .cloned()
-                .zip(embeddings)
-                .collect();
-            for upload_batch in embedded.chunks(100) {
-                uploader.upload_batch(upload_batch)?;
-                for (chunk, _) in upload_batch {
-                    let fid = util::display_file_id(chunk.file_id);
-                    *file_chunks.entry(fid.clone()).or_insert(0) += 1;
-                    file_expected.entry(fid).or_insert(chunk.chunk_count);
-                }
-            }
-        }
-
-        for (fid, count) in &file_chunks {
-            if Some(count) == file_expected.get(fid) {
-                let _ = uploader.mark_file_complete(fid, catalog_name);
-            }
         }
     }
 
@@ -164,19 +126,14 @@ pub fn run_incremental_crawl(
         changed_files: changed_count,
         unchanged_files: unchanged_count,
         deleted_files: deleted_count,
-        chunks_embedded: total_chunks,
+        chunks_ingested: total_ingested,
     })
 }
 
-/// Start a file watcher for a single catalog
 pub fn start_watcher(
     catalog_name: String,
     catalog_config: CatalogConfig,
-    embedder: Arc<HttpEmbedder>,
-    collection: String,
-    qdrant_url: Option<String>,
-    qdrant_api_key: Option<String>,
-    vector_size: usize,
+    client: std::sync::Arc<ApiClient>,
 ) {
     let watch_path = catalog_config.path.clone();
 
@@ -187,9 +144,7 @@ pub fn start_watcher(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     match event.kind {
-                        EventKind::Create(_)
-                        | EventKind::Modify(_)
-                        | EventKind::Remove(_) => {
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                             let _ = tx.send(event);
                         }
                         _ => {}
@@ -199,35 +154,17 @@ pub fn start_watcher(
         ) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!(
-                    "[{}] Failed to create watcher for '{}': {}",
-                    chrono_timestamp(),
-                    catalog_name,
-                    e
-                );
+                eprintln!("[{}] Failed to create watcher for '{}': {}", chrono_timestamp(), catalog_name, e);
                 return;
             }
         };
 
-        if let Err(e) =
-            file_watcher.watch(std::path::Path::new(&watch_path), RecursiveMode::Recursive)
-        {
-            eprintln!(
-                "[{}] Failed to watch '{}': {}",
-                chrono_timestamp(),
-                watch_path,
-                e
-            );
+        if let Err(e) = file_watcher.watch(std::path::Path::new(&watch_path), RecursiveMode::Recursive) {
+            eprintln!("[{}] Failed to watch '{}': {}", chrono_timestamp(), watch_path, e);
             return;
         }
 
-        eprintln!(
-            "[{}] Watching '{}' for changes (catalog: {})",
-            chrono_timestamp(),
-            watch_path,
-            catalog_name
-        );
-
+        eprintln!("[{}] Watching '{}' for changes (catalog: {})", chrono_timestamp(), watch_path, catalog_name);
         let _watcher = file_watcher;
 
         let mut has_pending = false;
@@ -250,52 +187,25 @@ pub fn start_watcher(
             }
 
             if has_pending && quiet_since.elapsed() >= Duration::from_secs(2) {
-                eprintln!(
-                    "[{}] Changes detected in '{}', re-indexing...",
-                    chrono_timestamp(),
-                    catalog_name
-                );
+                eprintln!("[{}] Changes detected in '{}', re-indexing...", chrono_timestamp(), catalog_name);
 
-                match run_incremental_crawl(
-                    &catalog_name,
-                    &catalog_config,
-                    &embedder,
-                    &collection,
-                    qdrant_url.as_deref(),
-                    qdrant_api_key.as_deref(),
-                    vector_size,
-                ) {
+                match run_incremental_crawl(&catalog_name, &catalog_config, &client) {
                     Ok(stats) => {
-                        let total_changes =
-                            stats.new_files + stats.changed_files + stats.deleted_files;
-                        if total_changes > 0 {
+                        let total = stats.new_files + stats.changed_files + stats.deleted_files;
+                        if total > 0 {
                             eprintln!(
                                 "[{}] Re-indexed '{}': {} new, {} changed, {} deleted ({} chunks)",
-                                chrono_timestamp(),
-                                catalog_name,
-                                stats.new_files,
-                                stats.changed_files,
-                                stats.deleted_files,
-                                stats.chunks_embedded
+                                chrono_timestamp(), catalog_name,
+                                stats.new_files, stats.changed_files, stats.deleted_files, stats.chunks_ingested
                             );
                         } else {
-                            eprintln!(
-                                "[{}] No indexable changes in '{}'",
-                                chrono_timestamp(),
-                                catalog_name
-                            );
+                            eprintln!("[{}] No indexable changes in '{}'", chrono_timestamp(), catalog_name);
                         }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[{}] Re-index failed for '{}': {}",
-                            chrono_timestamp(),
-                            catalog_name,
-                            e
-                        );
+                        eprintln!("[{}] Re-index failed for '{}': {}", chrono_timestamp(), catalog_name, e);
                     }
                 }
-
                 has_pending = false;
             }
         }
