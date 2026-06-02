@@ -534,9 +534,9 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
 
         // Phase 3: Cleanup
         println!("🗑️  Cleaning up orphaned files...");
-        for (file_path, _) in existing_files.iter() {
-            if !files_set.contains(file_path) {
-                uploader.delete_file(file_path, catalog_name)?;
+        for (rel_path, _) in existing_files.iter() {
+            if !rel_files_set.contains(rel_path) {
+                uploader.delete_file(rel_path, catalog_name)?;
                 files_deleted += 1;
             }
         }

@@ -57,6 +57,11 @@ pub fn should_skip_path(path: &str) -> bool {
         return true;
     }
 
+    // Skip Claude Code worktrees (ephemeral clones that confuse Qdrant indexing)
+    if path.contains("/.claude/worktrees/") {
+        return true;
+    }
+
     // === Standard Rush monorepo exclusions ===
 
     // Build outputs - always skip dist/ regardless of location
