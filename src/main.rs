@@ -21,6 +21,7 @@ const DEFAULT_API_URL: &str = "https://code-index.mcp.pape.house";
 
 /// Catalog configuration
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct CatalogConfig {
     pub(crate) r#type: String,
     pub(crate) path: String,
@@ -181,22 +182,29 @@ fn main() -> anyhow::Result<()> {
                 let abs_path = std::fs::canonicalize(&watch_path)?.to_string_lossy().to_string();
                 let resolved_type = if cli.r#type == "auto" { detect_catalog_type(&abs_path) } else { cli.r#type };
                 let catalog_name = catalog_name_from_path(&abs_path);
-                let config = CatalogConfig { r#type: resolved_type, path: abs_path };
-
-                eprintln!("Initial index for '{}'...", catalog_name);
-                match watcher::run_incremental_crawl(&catalog_name, &config, &api) {
-                    Ok(stats) => {
-                        eprintln!(
-                            "  {} new, {} changed, {} unchanged, {} deleted ({} chunks)",
-                            stats.new_files, stats.changed_files, stats.unchanged_files,
-                            stats.deleted_files, stats.chunks_ingested
-                        );
-                    }
-                    Err(e) => eprintln!("  Warning: initial crawl failed: {}", e),
-                }
+                let config = CatalogConfig { r#type: resolved_type, path: abs_path.clone() };
 
                 catalogs.push(catalog_name.clone());
-                watcher::start_watcher(catalog_name, config, api.clone());
+
+                // Initial crawl + watcher on a background thread so stdio
+                // is responsive immediately (Claude Code times out at 30s).
+                let bg_api = api.clone();
+                let bg_name = catalog_name.clone();
+                let bg_config = config.clone();
+                std::thread::spawn(move || {
+                    eprintln!("Initial index for '{}'...", bg_name);
+                    match watcher::run_incremental_crawl(&bg_name, &bg_config, &bg_api) {
+                        Ok(stats) => {
+                            eprintln!(
+                                "  {} new, {} changed, {} unchanged, {} deleted ({} chunks)",
+                                stats.new_files, stats.changed_files, stats.unchanged_files,
+                                stats.deleted_files, stats.chunks_ingested
+                            );
+                        }
+                        Err(e) => eprintln!("  Warning: initial crawl failed: {}", e),
+                    }
+                    watcher::start_watcher(bg_name, bg_config, bg_api);
+                });
             }
 
             stdio::run_stdio(&api, &catalogs);
