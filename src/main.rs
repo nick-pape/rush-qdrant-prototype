@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use engine::{
     config::should_skip_path,
     chunker::chunk_file,
-    ParallelEmbedder,
+    HttpEmbedder,
     partitioner::{partition_typescript, PartitionConfig, ChunkQualityReport, PartitionDebug},
     uploader::{QdrantUploader, PointResult},
     SMALL_CHUNK_CHARS,
@@ -24,6 +24,20 @@ use engine::{
 pub(crate) struct QdrantConfig {
     pub(crate) url: Option<String>,
     pub(crate) collection: String,
+    pub(crate) api_key: Option<String>,
+}
+
+/// Embedding API configuration
+#[derive(Debug, serde::Deserialize, Clone)]
+pub(crate) struct EmbedConfig {
+    /// Base URL for OpenAI-compatible embedding API (e.g. "http://ai.service.pape.house:3006/v1")
+    pub(crate) url: String,
+    /// Model name (e.g. "qwen3-embed-0.6b-cpu")
+    pub(crate) model: String,
+    /// Vector dimensions (e.g. 1024)
+    pub(crate) dimensions: usize,
+    /// API key for the embedding service (optional)
+    pub(crate) api_key: Option<String>,
 }
 
 /// Catalog configuration
@@ -40,6 +54,7 @@ pub(crate) struct CatalogConfig {
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct Config {
     pub(crate) qdrant: QdrantConfig,
+    pub(crate) embed: EmbedConfig,
     pub(crate) catalogs: HashMap<String, CatalogConfig>,
 }
 
@@ -199,14 +214,6 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
-/// Format ETA in seconds to human-readable string
-fn format_eta(secs: f64) -> String {
-    if secs <= 0.0 || !secs.is_finite() {
-        return "--".to_string();
-    }
-    format_duration(secs)
-}
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     
@@ -259,24 +266,27 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     let total_start = std::time::Instant::now();
     println!("🔍 Starting crawl...");
     println!("Catalog: {}", catalog_name);
-    
+
     // Get catalog config
     let catalog_config = config.catalogs.get(catalog_name)
         .ok_or_else(|| anyhow::anyhow!("Catalog '{}' not found in config", catalog_name))?;
-    
+
     let directory = &catalog_config.path;
-    
+
     println!("Directory: {}", directory);
     println!("Type: {}", catalog_config.r#type);
     println!("Collection: {}", config.qdrant.collection);
+    println!("Embed API: {} ({})", config.embed.url, config.embed.model);
     println!();
 
-    // Initialize parallel embedder
-    println!("⚙️  Loading embedding model...");
-    let embedder = ParallelEmbedder::new()?;
-    println!();
+    let embedder = HttpEmbedder::new(&config.embed.url, &config.embed.model, config.embed.dimensions, config.embed.api_key.as_deref())?;
 
-    let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
+    let uploader = QdrantUploader::new(
+        &config.qdrant.collection,
+        config.qdrant.url.as_deref(),
+        config.qdrant.api_key.as_deref(),
+        config.embed.dimensions,
+    )?;
 
     // Get existing files from DB for this catalog
     println!("📂 Checking existing index...");
@@ -436,79 +446,37 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     println!("\n  Found {} chunks to embed", total_chunks);
     println!();
 
-    // Phase 2: Embedding
-    let use_batch = std::env::var("RUSH_QDRANT_BATCH").unwrap_or_default() == "1";
-    let use_cpu_batch = std::env::var("RUSH_QDRANT_CPU_BATCH").unwrap_or_default() == "1";
-    let batch_size: usize = std::env::var("RUSH_QDRANT_BATCH_SIZE")
-        .unwrap_or_else(|_| "0".to_string())
-        .parse()
-        .unwrap_or(0); // 0 = all at once
+    // Phase 2: Embed via HTTP API and upload
+    println!("⚡ Phase 2: Embedding {} chunks via HTTP API...", total_chunks);
+    let embed_start = std::time::Instant::now();
 
-    if use_cpu_batch {
-        // ── CPU parallel-batch path: sort by length, mini-batch, distribute across workers ──
-        println!("⚡ Phase 2 (CPU-BATCH): Encoding {} chunks with {} workers (sorted + mini-batched)...",
-            total_chunks, embedder.num_workers());
-        let embed_start = std::time::Instant::now();
+    let mut total_embedded: usize = 0;
+    let mut file_chunks: HashMap<String, usize> = HashMap::new();
+    let mut file_expected: HashMap<String, usize> = HashMap::new();
 
-        let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
+    for (batch_idx, batch) in all_chunks.chunks(32).enumerate() {
+        let batch_start = std::time::Instant::now();
+        let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
+        let embeddings = embedder.embed_batch(&texts)?;
 
-        // Sort chunks by text length for efficient batching
-        all_chunks.sort_by_key(|c| c.text.len());
-        println!("  Sorted chunks by length (shortest: {} chars, longest: {} chars)",
-            all_chunks.first().map(|c| c.text.len()).unwrap_or(0),
-            all_chunks.last().map(|c| c.text.len()).unwrap_or(0));
+        let batch_elapsed = batch_start.elapsed();
+        let progress = ((batch_idx + 1) * 32).min(total_chunks);
+        eprintln!(
+            "[{}] Batch {}: {}/{} ({:.0}%) in {:.1}s",
+            chrono_timestamp(),
+            batch_idx + 1,
+            progress,
+            total_chunks,
+            (progress as f64 / total_chunks as f64) * 100.0,
+            batch_elapsed.as_secs_f64()
+        );
 
-        // Create adaptive mini-batches
-        const CHARS_PER_TOKEN: f64 = 4.0;
-        let mut mini_batches: Vec<Vec<engine::Chunk>> = Vec::new();
-        let mut cursor = 0;
-        while cursor < all_chunks.len() {
-            let longest_chars = all_chunks[cursor..]
-                .iter()
-                .take(32)
-                .last()
-                .map(|c| c.text.len())
-                .unwrap_or(100);
-            let est_tokens = (longest_chars as f64 / CHARS_PER_TOKEN).max(1.0);
-            let mb_size = ((4000.0 / est_tokens) as usize).clamp(4, 16);
-            let end = (cursor + mb_size).min(all_chunks.len());
-            mini_batches.push(all_chunks[cursor..end].to_vec());
-            cursor = end;
-        }
-        // Free original chunks — mini_batches owns copies now
-        drop(all_chunks);
-
-        println!("  Created {} mini-batches (sizes: {}-{})",
-            mini_batches.len(),
-            mini_batches.iter().map(|b| b.len()).min().unwrap_or(0),
-            mini_batches.iter().map(|b| b.len()).max().unwrap_or(0));
-
-        use rayon::prelude::*;
-        let all_embedded: Vec<(engine::Chunk, Vec<f32>)> = mini_batches
-            .into_par_iter()
-            .enumerate()
-            .flat_map(|(i, batch)| {
-                let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
-                match embedder.encode_batch_on_worker(&texts, i) {
-                    Ok(embeddings) => batch.into_iter().zip(embeddings).collect::<Vec<_>>(),
-                    Err(e) => {
-                        eprintln!("[{}] ⚠️ Batch embedding failed: {}", chrono_timestamp(), e);
-                        Vec::new()
-                    }
-                }
-            })
+        let embedded: Vec<(engine::Chunk, Vec<f32>)> = batch
+            .iter()
+            .cloned()
+            .zip(embeddings)
             .collect();
-
-        let embed_elapsed = embed_start.elapsed();
-        let embed_rate = all_embedded.len() as f64 / embed_elapsed.as_secs_f64().max(0.001);
-        println!("  Embedding complete: {:.1} chunks/sec ({:.1}s)", embed_rate, embed_elapsed.as_secs_f64());
-
-        // Upload in batches of 100 and track file completion
-        println!("  Uploading {} chunks to Qdrant...", all_embedded.len());
-        let upload_start = std::time::Instant::now();
-        let mut file_chunks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut file_expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for upload_batch in all_embedded.chunks(100) {
+        for upload_batch in embedded.chunks(100) {
             uploader.upload_batch(upload_batch)?;
             for (chunk, _) in upload_batch {
                 let fid = engine::util::display_file_id(chunk.file_id);
@@ -516,467 +484,41 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                 file_expected.entry(fid).or_insert(chunk.chunk_count);
             }
         }
-        for (fid, count) in &file_chunks {
-            if Some(count) == file_expected.get(fid) {
-                let _ = uploader.mark_file_complete(fid, catalog_name);
-            }
-        }
-        let embedded_count = all_embedded.len();
-        drop(all_embedded);
-
-        let upload_elapsed = upload_start.elapsed();
-        let total_phase2 = embed_elapsed.as_secs_f64() + upload_elapsed.as_secs_f64();
-        println!();
-        println!("  ✅ Embedded & uploaded {} chunks in {}", embedded_count, format_duration(total_phase2));
-        println!("  📊 Embedding rate: {:.1} chunks/sec (embed only)", embed_rate);
-        println!("  📊 Overall Phase 2 rate: {:.1} chunks/sec (embed + upload)", embedded_count as f64 / total_phase2.max(0.001));
-        println!();
-
-        // Phase 3: Cleanup
-        println!("🗑️  Cleaning up orphaned files...");
-        for (rel_path, _) in existing_files.iter() {
-            if !rel_files_set.contains(rel_path) {
-                uploader.delete_file(rel_path, catalog_name)?;
-                files_deleted += 1;
-            }
-        }
-
-        println!();
-        let total_elapsed = total_start.elapsed();
-        println!("✅ Crawl complete!");
-        println!("  Total time: {:?}", total_elapsed);
-        println!("  New files indexed: {}", new_count);
-        println!("  Changed files re-indexed: {}", changed_count);
-        println!("  Unchanged files skipped: {}", unchanged_count);
-        println!("Total chunks indexed: {}", total_chunks);
-        println!("Overall rate: {:.1} chunks/sec", total_chunks as f64 / total_elapsed.as_secs_f64().max(0.001));
-
-        return Ok(());
-    } else if use_batch {
-        // ── Batch-mode path: encode chunks in adaptive batches, upload immediately ──
-        println!("⚡ Phase 2 (BATCH): Encoding {} chunks{}...",
-            total_chunks,
-            if batch_size > 0 { format!(" in batches of {}", batch_size) } else { " all at once".to_string() });
-        let embed_start = std::time::Instant::now();
-
-        let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
-
-        // Sort chunks by text length so each batch has similar-length sequences,
-        // minimizing padding waste (attention is O(n²) in padded length)
-        all_chunks.sort_by_key(|c| c.text.len());
-        println!("  Sorted chunks by length (shortest: {} chars, longest: {} chars)",
-            all_chunks.first().map(|c| c.text.len()).unwrap_or(0),
-            all_chunks.last().map(|c| c.text.len()).unwrap_or(0));
-
-        // Adaptive batching: use larger batches for short sequences, smaller for long.
-        // VRAM cost scales as batch_size × seq_len². We calibrate from known-good:
-        // batch=8 at ~1500 tokens fits in 24GB → budget ≈ 8 × 1500² = 18M
-        // Use text length as a proxy for token count (~4 chars per token).
-        const VRAM_BUDGET: f64 = 18_000_000.0;
-        const CHARS_PER_TOKEN: f64 = 4.0;
-        const MIN_BATCH: usize = 4;
-        const MAX_BATCH: usize = 64;
-
-        let mut total_embedded: usize = 0;
-        let mut file_chunks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut file_expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut cursor = 0;
-        let mut batch_idx = 0;
-
-        while cursor < all_chunks.len() {
-            // Estimate token count of the longest chunk in this region
-            // (chunks are sorted, so the longest is at the end of any slice)
-            let longest_chars = all_chunks[cursor..].iter()
-                .take(MAX_BATCH)
-                .last()
-                .map(|c| c.text.len())
-                .unwrap_or(100);
-            let est_tokens = (longest_chars as f64 / CHARS_PER_TOKEN).max(1.0);
-            let adaptive_size = (VRAM_BUDGET / (est_tokens * est_tokens)) as usize;
-            let effective_batch_size = if batch_size > 0 {
-                batch_size.min(adaptive_size).max(MIN_BATCH)
-            } else {
-                adaptive_size.clamp(MIN_BATCH, MAX_BATCH)
-            };
-
-            let end = (cursor + effective_batch_size).min(all_chunks.len());
-            let batch_chunks = &all_chunks[cursor..end];
-
-            let batch_start = std::time::Instant::now();
-            let texts: Vec<&str> = batch_chunks.iter().map(|c| c.text.as_str()).collect();
-
-            let embeddings = embedder.encode_batch(&texts)?;
-
-            let batch_elapsed = batch_start.elapsed();
-            eprintln!("[{}] Batch {} ({}-{}/{}): {} chunks (adaptive b={}) in {:.1}s ({:.1} chunks/sec)",
-                chrono_timestamp(),
-                batch_idx + 1,
-                cursor + 1,
-                end,
-                total_chunks,
-                batch_chunks.len(),
-                effective_batch_size,
-                batch_elapsed.as_secs_f64(),
-                batch_chunks.len() as f64 / batch_elapsed.as_secs_f64().max(0.001));
-
-            // Upload this embedding batch immediately instead of accumulating
-            let batch_embedded: Vec<(engine::Chunk, Vec<f32>)> = batch_chunks
-                .iter()
-                .zip(embeddings.into_iter())
-                .map(|(chunk, embedding)| (chunk.clone(), embedding))
-                .collect();
-            for upload_batch in batch_embedded.chunks(100) {
-                uploader.upload_batch(upload_batch)?;
-                for (chunk, _) in upload_batch {
-                    let fid = engine::util::display_file_id(chunk.file_id);
-                    *file_chunks.entry(fid.clone()).or_insert(0) += 1;
-                    file_expected.entry(fid).or_insert(chunk.chunk_count);
-                }
-            }
-            total_embedded += batch_embedded.len();
-            drop(batch_embedded);
-
-            cursor = end;
-            batch_idx += 1;
-        }
-        // Free chunks now that all batches are embedded and uploaded
-        drop(all_chunks);
-
-        let embed_elapsed = embed_start.elapsed();
-        let embed_rate = total_chunks as f64 / embed_elapsed.as_secs_f64().max(0.001);
-        println!("  Embedding + upload complete: {:.1} chunks/sec ({:.1}s)", embed_rate, embed_elapsed.as_secs_f64());
-
-        // Mark files complete
-        for (fid, count) in &file_chunks {
-            if Some(count) == file_expected.get(fid) {
-                let _ = uploader.mark_file_complete(fid, catalog_name);
-            }
-        }
-
-        let total_elapsed_phase2 = embed_elapsed.as_secs_f64();
-        println!();
-        println!("  ✅ Embedded & uploaded {} chunks in {}", total_embedded, format_duration(total_elapsed_phase2));
-        println!("  📊 Rate: {:.1} chunks/sec (embed + upload)", total_embedded as f64 / total_elapsed_phase2.max(0.001));
-        println!();
-
-        // Phase 3: Cleanup orphaned files
-        println!("🗑️  Cleaning up orphaned files...");
-        for (rel_path, _) in existing_files.iter() {
-            if !rel_files_set.contains(rel_path) {
-                uploader.delete_file(rel_path, catalog_name)?;
-                files_deleted += 1;
-            }
-        }
-
-        println!();
-        println!();
-        let total_elapsed = total_start.elapsed();
-
-        println!("✅ Crawl complete!");
-        println!();
-        println!("📊 Summary:");
-        println!("  Total time: {:?}", total_elapsed);
-        println!("  New files indexed: {}", new_count);
-        println!("  Changed files re-indexed: {}", changed_count);
-        println!("  Unchanged files skipped: {}", unchanged_count);
-        println!("  Orphaned files deleted: {}", orphaned_count);
-        println!();
-        println!("Total chunks indexed: {}", total_chunks);
-        println!("Overall rate: {:.1} chunks/sec", total_chunks as f64 / total_elapsed.as_secs_f64().max(0.001));
-        println!("Files deleted from DB: {}", files_deleted);
-        println!();
-
-        // Update warning state
-        let mut next_warning_files: HashSet<String> = HashSet::new();
-        next_warning_files.extend(crawl_warning_files.iter().cloned());
-        if incremental_warnings {
-            next_warning_files.extend(warning_files.iter().cloned());
-        }
-        let json = serde_json::to_string_pretty(&next_warning_files)?;
-        std::fs::write(&warning_state_path, json)?;
-
-        if !crawl_warning_files.is_empty() {
-            let plural = if crawl_warning_files.len() == 1 { "file" } else { "files" };
-            println!("Chunking warnings in {} {}:", crawl_warning_files.len(), plural);
-            for file in crawl_warning_files.iter().take(20) {
-                println!("  - {}", file);
-            }
-            if crawl_warning_files.len() > 20 {
-                println!("  ... and {} more", crawl_warning_files.len() - 20);
-            }
-            println!();
-        }
-
-        return Ok(());
+        total_embedded += embedded.len();
     }
 
-    // ── Original streaming path (non-batch) ──
-    println!("⚡ Phase 2: Embedding {} chunks with {} parallel sessions...",
-        total_chunks, embedder.num_workers());
-    println!("  (Checkpoints every 60s - safe to CTRL+C)");
-    let embed_start = std::time::Instant::now();
-
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-    use crossbeam_channel::{unbounded, Sender, Receiver};
-    
-    // Channels for streaming embeddings to uploader
-    let (embed_tx, embed_rx): (Sender<(engine::Chunk, Vec<f32>)>, Receiver<(engine::Chunk, Vec<f32>)>) = unbounded();
-    
-    let processed = Arc::new(AtomicUsize::new(0));
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    
-    // Track last upload time
-    let last_upload_time = Arc::new(Mutex::new(std::time::Instant::now()));
-    
-    // Progress reporter thread - prints every 30 seconds
-    let processed_clone = Arc::clone(&processed);
-    let stop_clone = Arc::clone(&stop_flag);
-    let total_chunks_for_thread = total_chunks;
-    let embed_start_for_thread = std::time::Instant::now();
-    let last_print_time = Arc::new(Mutex::new(std::time::Instant::now()));
-    let last_print_clone = Arc::clone(&last_print_time);
-    
-    let progress_thread = std::thread::spawn(move || {
-        while !stop_clone.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            
-            let mut last = last_print_clone.lock().unwrap();
-            if last.elapsed() >= std::time::Duration::from_secs(30) {
-                let current = processed_clone.load(Ordering::Relaxed);
-                let elapsed = embed_start_for_thread.elapsed();
-                let rate = current as f64 / elapsed.as_secs_f64().max(0.001);
-                let remaining = (total_chunks_for_thread - current) as f64 / rate;
-                let eta = format_eta(remaining);
-                
-                eprintln!("[{}] Embedded {}/{} ({:.0}%) - {:.1} chunks/sec - ETA: {}", 
-                    chrono_timestamp(),
-                    current, total_chunks_for_thread, 
-                    (current as f64 / total_chunks_for_thread as f64) * 100.0,
-                    rate, eta);
-                
-                *last = std::time::Instant::now();
-            }
+    // Mark files complete
+    for (fid, count) in &file_chunks {
+        if Some(count) == file_expected.get(fid) {
+            let _ = uploader.mark_file_complete(fid, catalog_name);
         }
-    });
-    
-    // Wrap uploader in Arc<Mutex> for sharing across threads
-    let uploader = Arc::new(Mutex::new(uploader));
-    
-    // Uploader thread - uploads accumulated embeddings every 60 seconds
-    let stop_uploader = Arc::clone(&stop_flag);
-    let last_upload_time_clone = Arc::clone(&last_upload_time);
-    let uploader_clone = Arc::clone(&uploader);
-    let catalog_name_for_uploader = catalog_name.to_string();
+    }
 
-    let uploader_thread = std::thread::spawn(move || {
-        let mut accumulated: Vec<(engine::Chunk, Vec<f32>)> = Vec::new();
-        
-        // Track file completion:
-        // - expected_count[file_id]: total chunks expected for this file (set once, from chunk.chunk_count)
-        // - uploaded_count[file_id]: chunks successfully uploaded to Qdrant
-        let mut expected_count: HashMap<String, usize> = HashMap::new();
-        let mut uploaded_count: HashMap<String, usize> = HashMap::new();
-        
-        loop {
-            // Check if we should upload (60s elapsed or stopped)
-            let should_upload = {
-                let mut last = last_upload_time_clone.lock().unwrap();
-                if last.elapsed() >= std::time::Duration::from_secs(60) {
-                    *last = std::time::Instant::now();
-                    true
-                } else {
-                    false
-                }
-            };
-            
-            // Collect all available embeddings
-            // Track expected count per file (set once on first observation)
-            while let Ok(embedded) = embed_rx.try_recv() {
-                let file_id = engine::util::display_file_id(embedded.0.file_id);
-                
-                // Set expected count on first observation of this file
-                if let std::collections::hash_map::Entry::Vacant(e) = expected_count.entry(file_id.clone()) {
-                    e.insert(embedded.0.chunk_count);
-                } else {
-                    // Validate consistency: all chunks for same file should report same chunk_count
-                    let existing = expected_count.get(&file_id).unwrap();
-                    if *existing != embedded.0.chunk_count {
-                        eprintln!(
-                            "[{}] ⚠️ Inconsistent chunk_count for file {}: expected {}, got {}",
-                            chrono_timestamp(), file_id, existing, embedded.0.chunk_count
-                        );
-                    }
-                }
-                
-                accumulated.push(embedded);
-            }
-            
-            if should_upload && !accumulated.is_empty() {
-                let count = accumulated.len();
-                eprintln!("[{}] Uploading checkpoint ({} chunks)...", chrono_timestamp(), count);
-                
-                let uploader_guard = uploader_clone.lock().unwrap();
-                match uploader_guard.upload_batch(&accumulated) {
-                    Err(e) => {
-                        eprintln!("[{}] ⚠️ Upload failed: {}", chrono_timestamp(), e);
-                        // Do NOT update uploaded_count - these chunks were not persisted
-                    }
-                    Ok(_) => {
-                        // Upload succeeded - now update uploaded_count per file
-                        let mut files_in_batch: HashMap<String, usize> = HashMap::new();
-                        for (chunk, _) in &accumulated {
-                            let file_id = engine::util::display_file_id(chunk.file_id);
-                            *files_in_batch.entry(file_id).or_insert(0) += 1;
-                        }
-                        
-                        // Merge into uploaded_count
-                        for (file_id, batch_count) in &files_in_batch {
-                            *uploaded_count.entry(file_id.clone()).or_insert(0) += batch_count;
-                        }
-                        
-                        // Check completion once per file (files where uploaded == expected)
-                        let mut completed_files: Vec<String> = Vec::new();
-                        for file_id in files_in_batch.keys() {
-                            let uploaded = uploaded_count.get(file_id).copied().unwrap_or(0);
-                            let expected = expected_count.get(file_id).copied().unwrap_or(0);
-                            if uploaded == expected && expected > 0 {
-                                completed_files.push(file_id.clone());
-                            }
-                        }
-                        
-                        // Mark completed files and clean up tracking state
-                        for file_id in &completed_files {
-                            if let Err(e) = uploader_guard.mark_file_complete(file_id, &catalog_name_for_uploader) {
-                                eprintln!("[{}] ⚠️ Failed to mark file complete: {}", chrono_timestamp(), e);
-                            }
-                            // Remove tracking state for completed files
-                            uploaded_count.remove(file_id);
-                            expected_count.remove(file_id);
-                        }
-                        
-                        eprintln!("[{}] Checkpoint saved ({} files completed)", chrono_timestamp(), completed_files.len());
-                    }
-                }
-                drop(uploader_guard);
-                accumulated.clear();
-            }
-            
-            // Check if done
-            if stop_uploader.load(Ordering::Relaxed) {
-                // Drain remaining
-                while let Ok(embedded) = embed_rx.try_recv() {
-                    let file_id = engine::util::display_file_id(embedded.0.file_id);
-                    
-                    if let std::collections::hash_map::Entry::Vacant(e) = expected_count.entry(file_id.clone()) {
-                        e.insert(embedded.0.chunk_count);
-                    }
-                    
-                    accumulated.push(embedded);
-                }
-                
-                // Final upload
-                if !accumulated.is_empty() {
-                    eprintln!("[{}] Uploading final batch ({} chunks)...", chrono_timestamp(), accumulated.len());
-                    
-                    let uploader_guard = uploader_clone.lock().unwrap();
-                    match uploader_guard.upload_batch(&accumulated) {
-                        Err(e) => {
-                            eprintln!("[{}] ⚠️ Final upload failed: {}", chrono_timestamp(), e);
-                        }
-                        Ok(_) => {
-                            // Update uploaded_count
-                            let mut files_in_batch: HashMap<String, usize> = HashMap::new();
-                            for (chunk, _) in &accumulated {
-                                let file_id = engine::util::display_file_id(chunk.file_id);
-                                *files_in_batch.entry(file_id).or_insert(0) += 1;
-                            }
-                            
-                            for (file_id, batch_count) in &files_in_batch {
-                                *uploaded_count.entry(file_id.clone()).or_insert(0) += batch_count;
-                            }
-                            
-                            // Check and mark completed files
-                            let mut completed_files: Vec<String> = Vec::new();
-                            for file_id in files_in_batch.keys() {
-                                let uploaded = uploaded_count.get(file_id).copied().unwrap_or(0);
-                                let expected = expected_count.get(file_id).copied().unwrap_or(0);
-                                if uploaded == expected && expected > 0 {
-                                    completed_files.push(file_id.clone());
-                                }
-                            }
-                            
-                            for file_id in &completed_files {
-                                if let Err(e) = uploader_guard.mark_file_complete(file_id, &catalog_name_for_uploader) {
-                                    eprintln!("[{}] ⚠️ Failed to mark file complete: {}", chrono_timestamp(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-            
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    });
-    
-    // Process all chunks in parallel, streaming results to uploader
-    let embed_tx_clone = embed_tx.clone();
-    let processed_embed = Arc::clone(&processed);
-    
-    all_chunks
-        .into_par_iter()
-        .enumerate()
-        .try_for_each(|(i, chunk)| -> anyhow::Result<()> {
-            let embedding = embedder.encode(&chunk.text, i)?;
-            
-            // Update counter
-            processed_embed.fetch_add(1, Ordering::Relaxed);
-            
-            // Send to uploader
-            embed_tx_clone.send((chunk, embedding))?;
-            
-            Ok(())
-        })?;
-    
-    // Signal threads to stop
-    stop_flag.store(true, Ordering::Relaxed);
-    
-    // Wait for threads
-    drop(embed_tx); // Close channel
-    let _ = progress_thread.join();
-    let _ = uploader_thread.join();
-    
     let embed_elapsed = embed_start.elapsed();
-    let total_uploaded = processed.load(Ordering::Relaxed);
-    let embed_rate = if embed_elapsed.as_secs() > 0 {
-        total_uploaded as f64 / embed_elapsed.as_secs_f64()
-    } else {
-        total_uploaded as f64
-    };
     println!();
-    println!("  ✅ Embedded & uploaded {} chunks in {}", total_uploaded, format_duration(embed_elapsed.as_secs_f64()));
-    println!("  📊 Embedding rate: {:.1} chunks/sec", embed_rate);
+    println!(
+        "  ✅ Embedded & uploaded {} chunks in {}",
+        total_embedded,
+        format_duration(embed_elapsed.as_secs_f64())
+    );
+    println!(
+        "  📊 Rate: {:.1} chunks/sec",
+        total_embedded as f64 / embed_elapsed.as_secs_f64().max(0.001)
+    );
     println!();
-    
+
     // Phase 3: Cleanup orphaned files
     println!("🗑️  Cleaning up orphaned files...");
-    {
-        let uploader_guard = uploader.lock().unwrap();
-        for (rel_path, _) in existing_files.iter() {
-            if !rel_files_set.contains(rel_path) {
-                uploader_guard.delete_file(rel_path, catalog_name)?;
-                files_deleted += 1;
-            }
+    for (rel_path, _) in existing_files.iter() {
+        if !rel_files_set.contains(rel_path) {
+            uploader.delete_file(rel_path, catalog_name)?;
+            files_deleted += 1;
         }
     }
 
     println!();
-    println!();
     let total_elapsed = total_start.elapsed();
-    
+
     println!("✅ Crawl complete!");
     println!();
     println!("📊 Summary:");
@@ -987,22 +529,18 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     println!("  Orphaned files deleted: {}", orphaned_count);
     println!();
     println!("Total chunks indexed: {}", total_chunks);
-    println!("Overall rate: {:.1} chunks/sec", total_chunks as f64 / total_elapsed.as_secs_f64().max(0.001));
     println!("Files deleted from DB: {}", files_deleted);
     println!();
 
-    // Update warning state: keep files that had warnings this crawl
-    // plus any previous warning files that were skipped due to incremental mode.
+    // Update warning state
     let mut next_warning_files: HashSet<String> = HashSet::new();
     next_warning_files.extend(crawl_warning_files.iter().cloned());
     if incremental_warnings {
-        // In this mode, unchanged warning files may remain skipped; preserve prior state.
         next_warning_files.extend(warning_files.iter().cloned());
     }
     let json = serde_json::to_string_pretty(&next_warning_files)?;
     std::fs::write(&warning_state_path, json)?;
 
-    // Warning summary
     if !crawl_warning_files.is_empty() {
         let plural = if crawl_warning_files.len() == 1 { "file" } else { "files" };
         println!("Chunking warnings in {} {}:", crawl_warning_files.len(), plural);
@@ -1020,12 +558,15 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
 
 /// Run search with compact blurb output
 fn run_search(config: &Config, text: &str, limit: usize, catalog: Option<&str>) -> anyhow::Result<()> {
-    // Generate embedding for query
-    let embedder = ParallelEmbedder::new()?;
-    let embedding = embedder.encode(text, 0)?;
-    
-    // Query Qdrant
-    let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
+    let embedder = HttpEmbedder::new(&config.embed.url, &config.embed.model, config.embed.dimensions, config.embed.api_key.as_deref())?;
+    let embedding = embedder.embed_single(text)?;
+
+    let uploader = QdrantUploader::new(
+        &config.qdrant.collection,
+        config.qdrant.url.as_deref(),
+        config.qdrant.api_key.as_deref(),
+        config.embed.dimensions,
+    )?;
     let results = uploader.query(&embedding, limit, catalog)?;
     
     // Display results as blurbs
@@ -1153,7 +694,12 @@ fn run_view(config: &Config, id_specs: &[String], show_full_paths: bool, chunks_
     }
     
     // Query Qdrant
-    let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
+    let uploader = QdrantUploader::new(
+        &config.qdrant.collection,
+        config.qdrant.url.as_deref(),
+        config.qdrant.api_key.as_deref(),
+        config.embed.dimensions,
+    )?;
     
     // Collect all results with their original selectors for display
     let mut all_results: Vec<(String, ChunkSelector, Vec<PointResult>)> = Vec::new();
@@ -1248,25 +794,30 @@ fn run_view(config: &Config, id_specs: &[String], show_full_paths: bool, chunks_
 
 /// Run purge command (delete all chunks from a catalog or entire collection)
 fn run_purge(config: &Config, catalog: Option<&str>, all: bool) -> anyhow::Result<()> {
-    let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
+    let uploader = QdrantUploader::new(
+        &config.qdrant.collection,
+        config.qdrant.url.as_deref(),
+        config.qdrant.api_key.as_deref(),
+        config.embed.dimensions,
+    )?;
 
     if all {
         println!("🗑️  Purging entire collection: {}", config.qdrant.collection);
         println!("This will delete ALL data from the collection!");
         
-        // Delete all points with empty filter
         let endpoint = format!(
             "{}/collections/{}/points/delete",
             config.qdrant.url.as_deref().unwrap_or("http://localhost:6333"),
             config.qdrant.collection
         );
-        
+
         let empty_filter = serde_json::json!({"filter": {}});
-        
-        let response = reqwest::blocking::Client::new()
-            .post(&endpoint)
-            .json(&empty_filter)
-            .send()?;
+
+        let mut req = reqwest::blocking::Client::new().post(&endpoint).json(&empty_filter);
+        if let Some(ref key) = config.qdrant.api_key {
+            req = req.header("api-key", key);
+        }
+        let response = req.send()?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!("Failed to purge collection: HTTP {}", response.status()));

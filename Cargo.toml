@@ -4,12 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# ML/Embeddings
-ort = { version = "2.0.0-rc.11", features = ["download-binaries", "load-dynamic"] }
-ndarray = "0.16"
-tokenizers = "0.21.0"
-hf-hub = "0.4.0"
-
 # CLI
 clap = { version = "4.5.23", features = ["derive"] }
 
@@ -30,9 +24,6 @@ twox-hash = "1.6"
 serde_bytes = "0.11"
 shellexpand = "3.0"
 sha2 = "0.10"
-num_cpus = "1.16"
-rayon = "1.10"
-crossbeam-channel = "0.5"
 
 # Tree-sitter for AST parsing
 tree-sitter = "0.22"
@@ -46,7 +37,3 @@ notify = "7"
 
 [dev-dependencies]
 insta = { version = "1.34", features = ["yaml"] }
-
-[features]
-default = []
-coreml = ["ort/coreml"]

@@ -8,16 +8,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::engine::ParallelEmbedder;
+use crate::engine::HttpEmbedder;
 use crate::engine::QdrantUploader;
 use crate::{Config, CatalogConfig, parse_file_id_with_selector, ChunkSelector};
 use crate::watcher;
 
 /// Shared state for the MCP server
 pub struct McpState {
-    pub embedder: Arc<ParallelEmbedder>,
+    pub embedder: Arc<HttpEmbedder>,
     pub collection: String,
     pub qdrant_url: Option<String>,
+    pub qdrant_api_key: Option<String>,
+    pub vector_size: usize,
     pub catalogs: HashMap<String, CatalogConfig>,
 }
 
@@ -254,10 +256,17 @@ async fn handle_search(
     let embedder = state.embedder.clone();
     let collection = state.collection.clone();
     let qdrant_url = state.qdrant_url.clone();
+    let qdrant_api_key = state.qdrant_api_key.clone();
+    let vector_size = state.vector_size;
 
     let result = web::block(move || -> anyhow::Result<String> {
-        let embedding = embedder.encode(&query, 0)?;
-        let uploader = QdrantUploader::new(&collection, qdrant_url.as_deref())?;
+        let embedding = embedder.embed_single(&query)?;
+        let uploader = QdrantUploader::new(
+            &collection,
+            qdrant_url.as_deref(),
+            qdrant_api_key.as_deref(),
+            vector_size,
+        )?;
         let results = uploader.query(&embedding, limit, catalog.as_deref())?;
 
         let mut output = String::new();
@@ -339,10 +348,17 @@ async fn handle_view(
 
     let collection = state.collection.clone();
     let qdrant_url = state.qdrant_url.clone();
+    let qdrant_api_key = state.qdrant_api_key.clone();
+    let vector_size = state.vector_size;
     let catalogs = state.catalogs.clone();
 
     let result = web::block(move || -> anyhow::Result<String> {
-        let uploader = QdrantUploader::new(&collection, qdrant_url.as_deref())?;
+        let uploader = QdrantUploader::new(
+            &collection,
+            qdrant_url.as_deref(),
+            qdrant_api_key.as_deref(),
+            vector_size,
+        )?;
         let mut output = String::new();
 
         for spec in &ids {
@@ -452,45 +468,10 @@ async fn handle_delete() -> HttpResponse {
     HttpResponse::Ok().finish()
 }
 
-/// Ensure the Qdrant collection exists, creating it if needed
-fn ensure_collection(qdrant_url: &str, collection: &str) -> anyhow::Result<()> {
-    let client = reqwest::blocking::Client::new();
-
-    // Check if collection exists
-    let url = format!("{}/collections/{}", qdrant_url, collection);
-    let resp = client.get(&url).send()?;
-    if resp.status().is_success() {
-        return Ok(());
-    }
-
-    // Create collection with 768-dim cosine vectors
-    eprintln!("Creating Qdrant collection '{}'...", collection);
-    let body = serde_json::json!({
-        "vectors": {
-            "size": 768,
-            "distance": "Cosine"
-        }
-    });
-    let resp = client.put(&url).json(&body).send()?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        return Err(anyhow::anyhow!(
-            "Failed to create collection '{}': HTTP {} - {}",
-            collection,
-            status,
-            text
-        ));
-    }
-
-    eprintln!("Collection '{}' created.", collection);
-    Ok(())
-}
-
 /// Start the MCP server daemon
 ///
-/// Loads the embedding model, runs initial indexing for all catalogs,
-/// starts file watchers, and serves MCP tools over HTTP.
+/// Connects to the remote embedding API, runs initial indexing for all
+/// catalogs, starts file watchers, and serves MCP tools over HTTP.
 pub fn run_mcp(config: &Config, port: u16) -> anyhow::Result<()> {
     let qdrant_url = config
         .qdrant
@@ -500,12 +481,22 @@ pub fn run_mcp(config: &Config, port: u16) -> anyhow::Result<()> {
         .to_string();
 
     // Step 1: Ensure Qdrant collection exists
-    ensure_collection(&qdrant_url, &config.qdrant.collection)?;
+    let uploader = QdrantUploader::new(
+        &config.qdrant.collection,
+        Some(&qdrant_url),
+        config.qdrant.api_key.as_deref(),
+        config.embed.dimensions,
+    )?;
+    uploader.ensure_collection()?;
 
-    // Step 2: Load embedding model (shared across all operations)
-    eprintln!("Loading embedding model...");
-    let embedder = Arc::new(ParallelEmbedder::new()?);
-    eprintln!();
+    // Step 2: Create HTTP embedder (shared across all operations)
+    eprintln!(
+        "Using remote embedder: {} (model: {}, {}d)",
+        config.embed.url, config.embed.model, config.embed.dimensions
+    );
+    let embedder = Arc::new(
+        HttpEmbedder::new(&config.embed.url, &config.embed.model, config.embed.dimensions, config.embed.api_key.as_deref())?
+    );
 
     // Step 3: Initial incremental crawl for each catalog
     for (name, catalog) in &config.catalogs {
@@ -516,6 +507,8 @@ pub fn run_mcp(config: &Config, port: u16) -> anyhow::Result<()> {
             &embedder,
             &config.qdrant.collection,
             Some(&qdrant_url),
+            config.qdrant.api_key.as_deref(),
+            config.embed.dimensions,
         ) {
             Ok(stats) => {
                 eprintln!(
@@ -533,15 +526,6 @@ pub fn run_mcp(config: &Config, port: u16) -> anyhow::Result<()> {
         }
     }
 
-    // Step 3b: Release bulk-crawl embedder and recreate with small arena for queries.
-    // This frees the large CUDA arena (~20GB) and replaces it with a 512MB one.
-    drop(embedder);
-    eprintln!("Reloading embedding model with query-optimized settings...");
-    let embedder = Arc::new(ParallelEmbedder::with_config(
-        crate::engine::ParallelConfig::for_query(),
-    )?);
-    eprintln!();
-
     // Step 4: Start file watchers for each catalog
     for (name, catalog) in &config.catalogs {
         watcher::start_watcher(
@@ -550,6 +534,8 @@ pub fn run_mcp(config: &Config, port: u16) -> anyhow::Result<()> {
             embedder.clone(),
             config.qdrant.collection.clone(),
             Some(qdrant_url.clone()),
+            config.qdrant.api_key.clone(),
+            config.embed.dimensions,
         );
     }
 
@@ -567,6 +553,8 @@ pub fn run_mcp(config: &Config, port: u16) -> anyhow::Result<()> {
         embedder,
         collection: config.qdrant.collection.clone(),
         qdrant_url: Some(qdrant_url),
+        qdrant_api_key: config.qdrant.api_key.clone(),
+        vector_size: config.embed.dimensions,
         catalogs: config.catalogs.clone(),
     };
 

@@ -11,7 +11,7 @@ use notify::{Watcher, RecursiveMode, Event, EventKind};
 
 use crate::engine::config::should_skip_path;
 use crate::engine::chunker::chunk_file;
-use crate::engine::ParallelEmbedder;
+use crate::engine::HttpEmbedder;
 use crate::engine::QdrantUploader;
 use crate::engine::util;
 use crate::{CatalogConfig, is_text_file, chrono_timestamp};
@@ -26,24 +26,23 @@ pub struct CrawlStats {
 }
 
 /// Run an incremental crawl for a single catalog
-///
-/// Scans the catalog directory, compares with the existing Qdrant index,
-/// and re-indexes changed/new files. Removes orphaned files.
 pub fn run_incremental_crawl(
     catalog_name: &str,
     catalog_config: &CatalogConfig,
-    embedder: &ParallelEmbedder,
+    embedder: &HttpEmbedder,
     collection: &str,
     qdrant_url: Option<&str>,
+    qdrant_api_key: Option<&str>,
+    vector_size: usize,
 ) -> anyhow::Result<CrawlStats> {
     let directory = &catalog_config.path;
-    let uploader = QdrantUploader::new(collection, qdrant_url)?;
+    let uploader = QdrantUploader::new(collection, qdrant_url, qdrant_api_key, vector_size)?;
 
     // Get existing files from Qdrant
     let existing_files = uploader.get_catalog_files(catalog_name)?;
 
     // Scan directory
-    let mut files_to_process: Vec<(String, String)> = Vec::new(); // (absolute_path, relative_path)
+    let mut files_to_process: Vec<(String, String)> = Vec::new();
     for entry in walkdir::WalkDir::new(directory)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -69,7 +68,6 @@ pub fn run_incremental_crawl(
     let mut all_chunks: Vec<crate::engine::Chunk> = Vec::new();
 
     for (file_path, rel_path) in &files_to_process {
-        // Read file and compute hash
         let content = match std::fs::read_to_string(file_path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -80,20 +78,17 @@ pub fn run_incremental_crawl(
         hasher.update(content.as_bytes());
         let current_hash = format!("sha256:{:x}", hasher.finalize());
 
-        // Check if unchanged (using relative path for portability across machines)
         if let Some(existing_info) = existing_files.get(rel_path) {
             if existing_info.content_hash == current_hash && existing_info.file_complete {
                 unchanged_count += 1;
                 continue;
             }
-            // Changed or incomplete — delete old chunks
             uploader.delete_file(rel_path, catalog_name)?;
             changed_count += 1;
         } else {
             new_count += 1;
         }
 
-        // Chunk the file
         let package_name = if catalog_config.r#type == "monorepo" {
             crate::engine::package_lookup::find_package_name(file_path, directory)
         } else {
@@ -108,7 +103,6 @@ pub fn run_incremental_crawl(
         match chunk_file(file_path, catalog_name, directory, &package_name, 6000) {
             Ok(chunks) => {
                 for mut chunk in chunks {
-                    // Strip fallback marker from breadcrumb
                     chunk.breadcrumb = chunk.breadcrumb.replace(":[fallback-split]", "");
                     all_chunks.push(chunk);
                 }
@@ -133,67 +127,21 @@ pub fn run_incremental_crawl(
         }
     }
 
-    // Embed and upload chunks in streaming batches to limit memory
+    // Embed via HTTP API and upload
     let total_chunks = all_chunks.len();
     if total_chunks > 0 {
-        use rayon::prelude::*;
-
-        let use_cpu_batch = std::env::var("RUSH_QDRANT_CPU_BATCH").unwrap_or_default() == "1";
-
-        // Track file completion across upload batches
         let mut file_chunks: HashMap<String, usize> = HashMap::new();
         let mut file_expected: HashMap<String, usize> = HashMap::new();
 
-        if use_cpu_batch {
-            // Parallel batching: sort by length, group into mini-batches,
-            // distribute across workers for maximum throughput on CPU.
-            all_chunks.sort_by_key(|c| c.text.len());
+        for batch in all_chunks.chunks(32) {
+            let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
+            let embeddings = embedder.embed_batch(&texts)?;
 
-            // Adaptive mini-batch sizing: short chunks get larger batches
-            const CHARS_PER_TOKEN: f64 = 4.0;
-            let mut mini_batches: Vec<Vec<crate::engine::Chunk>> = Vec::new();
-            let mut cursor = 0;
-            while cursor < all_chunks.len() {
-                let longest_chars = all_chunks[cursor..]
-                    .iter()
-                    .take(32)
-                    .last()
-                    .map(|c| c.text.len())
-                    .unwrap_or(100);
-                let est_tokens = (longest_chars as f64 / CHARS_PER_TOKEN).max(1.0);
-                // CPU budget: scale batch size inversely with token count
-                // Short chunks (<250 tokens): batch=16, medium: batch=8, long: batch=4
-                let batch_size = ((4000.0 / est_tokens) as usize).clamp(4, 16);
-                let end = (cursor + batch_size).min(all_chunks.len());
-                mini_batches.push(all_chunks[cursor..end].to_vec());
-                cursor = end;
-            }
-            // Free the original chunks now that mini_batches owns copies
-            drop(all_chunks);
-
-            let embedded: Vec<(crate::engine::Chunk, Vec<f32>)> = mini_batches
-                .into_par_iter()
-                .enumerate()
-                .flat_map(|(i, batch)| {
-                    let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
-                    match embedder.encode_batch_on_worker(&texts, i) {
-                        Ok(embeddings) => batch
-                            .into_iter()
-                            .zip(embeddings)
-                            .collect::<Vec<_>>(),
-                        Err(e) => {
-                            eprintln!(
-                                "[{}] Warning: batch embedding failed: {}",
-                                chrono_timestamp(),
-                                e
-                            );
-                            Vec::new()
-                        }
-                    }
-                })
+            let embedded: Vec<(crate::engine::Chunk, Vec<f32>)> = batch
+                .iter()
+                .cloned()
+                .zip(embeddings)
                 .collect();
-
-            // Upload in batches of 100 and free each batch
             for upload_batch in embedded.chunks(100) {
                 uploader.upload_batch(upload_batch)?;
                 for (chunk, _) in upload_batch {
@@ -202,38 +150,8 @@ pub fn run_incremental_crawl(
                     file_expected.entry(fid).or_insert(chunk.chunk_count);
                 }
             }
-            drop(embedded);
-        } else {
-            // Default: individual encode per chunk, parallel across workers
-            let embedded: Vec<(crate::engine::Chunk, Vec<f32>)> = all_chunks
-                .into_par_iter()
-                .enumerate()
-                .filter_map(|(i, chunk)| match embedder.encode(&chunk.text, i) {
-                    Ok(embedding) => Some((chunk, embedding)),
-                    Err(e) => {
-                        eprintln!(
-                            "[{}] Warning: embedding failed: {}",
-                            chrono_timestamp(),
-                            e
-                        );
-                        None
-                    }
-                })
-                .collect();
+        }
 
-            // Upload in batches of 100 and free each batch
-            for upload_batch in embedded.chunks(100) {
-                uploader.upload_batch(upload_batch)?;
-                for (chunk, _) in upload_batch {
-                    let fid = util::display_file_id(chunk.file_id);
-                    *file_chunks.entry(fid.clone()).or_insert(0) += 1;
-                    file_expected.entry(fid).or_insert(chunk.chunk_count);
-                }
-            }
-            drop(embedded);
-        };
-
-        // Mark files complete
         for (fid, count) in &file_chunks {
             if Some(count) == file_expected.get(fid) {
                 let _ = uploader.mark_file_complete(fid, catalog_name);
@@ -251,15 +169,14 @@ pub fn run_incremental_crawl(
 }
 
 /// Start a file watcher for a single catalog
-///
-/// Spawns a background thread that watches for file changes,
-/// debounces them (2 second quiet window), and triggers incremental re-indexing.
 pub fn start_watcher(
     catalog_name: String,
     catalog_config: CatalogConfig,
-    embedder: Arc<ParallelEmbedder>,
+    embedder: Arc<HttpEmbedder>,
     collection: String,
     qdrant_url: Option<String>,
+    qdrant_api_key: Option<String>,
+    vector_size: usize,
 ) {
     let watch_path = catalog_config.path.clone();
 
@@ -311,7 +228,6 @@ pub fn start_watcher(
             catalog_name
         );
 
-        // Keep watcher alive by holding it in scope
         let _watcher = file_watcher;
 
         let mut has_pending = false;
@@ -320,7 +236,6 @@ pub fn start_watcher(
         loop {
             match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(event) => {
-                    // Only react to relevant file changes
                     let has_relevant = event.paths.iter().any(|p| {
                         let path_str = p.to_string_lossy();
                         !should_skip_path(&path_str) && is_text_file(&path_str)
@@ -347,6 +262,8 @@ pub fn start_watcher(
                     &embedder,
                     &collection,
                     qdrant_url.as_deref(),
+                    qdrant_api_key.as_deref(),
+                    vector_size,
                 ) {
                     Ok(stats) => {
                         let total_changes =

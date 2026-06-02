@@ -38,6 +38,8 @@ pub struct QdrantUploader {
     client: Client,
     url: String,
     collection: String,
+    api_key: Option<String>,
+    vector_size: usize,
 }
 
 /// Request body for Qdrant upsert operation
@@ -184,9 +186,14 @@ pub struct SearchResult {
 
 impl QdrantUploader {
     /// Creates a new Qdrant uploader
-    pub fn new(collection: &str, qdrant_url: Option<&str>) -> Result<Self> {
+    pub fn new(
+        collection: &str,
+        qdrant_url: Option<&str>,
+        api_key: Option<&str>,
+        vector_size: usize,
+    ) -> Result<Self> {
         let url = qdrant_url.unwrap_or(DEFAULT_QDRANT_URL).to_string();
-        
+
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
@@ -195,7 +202,17 @@ impl QdrantUploader {
             client,
             url,
             collection: collection.to_string(),
+            api_key: api_key.map(|s| s.to_string()),
+            vector_size,
         })
+    }
+
+    fn request(&self, method: reqwest::Method, endpoint: &str) -> reqwest::blocking::RequestBuilder {
+        let mut builder = self.client.request(method, endpoint);
+        if let Some(ref key) = self.api_key {
+            builder = builder.header("api-key", key);
+        }
+        builder
     }
 
     /// Delete all points for a specific catalog
@@ -214,7 +231,7 @@ impl QdrantUploader {
             },
         };
 
-        let response = self.client.post(&endpoint).json(&request_body).send()?;
+        let response = self.request(reqwest::Method::POST, &endpoint).json(&request_body).send()?;
 
         if !response.status().is_success() {
             return Err(anyhow!("Failed to delete catalog: HTTP {}", response.status()));
@@ -243,7 +260,7 @@ impl QdrantUploader {
             },
         };
 
-        let response = self.client.post(&endpoint).json(&request_body).send()?;
+        let response = self.request(reqwest::Method::POST, &endpoint).json(&request_body).send()?;
 
         if !response.status().is_success() {
             return Err(anyhow!("Failed to delete file: HTTP {}", response.status()));
@@ -298,7 +315,7 @@ impl QdrantUploader {
                 offset: offset.clone(),
             };
 
-            let response = self.client.post(&endpoint).json(&request_body).send()?;
+            let response = self.request(reqwest::Method::POST, &endpoint).json(&request_body).send()?;
 
             if !response.status().is_success() {
                 return Err(anyhow!("Failed to scroll catalog: HTTP {}", response.status()));
@@ -378,8 +395,7 @@ impl QdrantUploader {
         let endpoint = format!("{}/collections/{}/points", self.url, self.collection);
         
         let response = self
-            .client
-            .put(&endpoint)
+            .request(reqwest::Method::PUT, &endpoint)
             .json(&request_body)
             .send()?
             .json::<UpsertResponse>()?;
@@ -438,7 +454,7 @@ impl QdrantUploader {
             limit: 1,
         };
 
-        let response = self.client.post(&endpoint).json(&request_body).send()?;
+        let response = self.request(reqwest::Method::POST, &endpoint).json(&request_body).send()?;
 
         if !response.status().is_success() {
             return Err(anyhow!("Failed to find chunk #1 for file {}: HTTP {}", file_id, response.status()));
@@ -493,7 +509,7 @@ impl QdrantUploader {
             self.url, self.collection
         );
 
-        let response = self.client.post(&endpoint).json(&request_body).send()?;
+        let response = self.request(reqwest::Method::POST, &endpoint).json(&request_body).send()?;
 
         if !response.status().is_success() {
             return Err(anyhow!("Failed to set file_complete for {}: HTTP {}", file_id, response.status()));
@@ -529,8 +545,7 @@ impl QdrantUploader {
         let endpoint = format!("{}/collections/{}/points/search", self.url, self.collection);
         
         let response = self
-            .client
-            .post(&endpoint)
+            .request(reqwest::Method::POST, &endpoint)
             .json(&request_body)
             .send()?
             .json::<SearchResponse>()?;
@@ -555,8 +570,7 @@ impl QdrantUploader {
         let endpoint = format!("{}/collections/{}/points", self.url, self.collection);
         
         let response = self
-            .client
-            .post(&endpoint)
+            .request(reqwest::Method::POST, &endpoint)
             .json(&request_body)
             .send()?;
         
@@ -571,6 +585,36 @@ impl QdrantUploader {
 
         let point_response: PointResponse = response.json()?;
         Ok(point_response.result.into_iter().next())
+    }
+
+    /// Ensure the Qdrant collection exists, creating it if needed
+    pub fn ensure_collection(&self) -> Result<()> {
+        let url = format!("{}/collections/{}", self.url, self.collection);
+        let resp = self.request(reqwest::Method::GET, &url).send()?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        eprintln!("Creating Qdrant collection '{}'...", self.collection);
+        let body = serde_json::json!({
+            "vectors": {
+                "size": self.vector_size,
+                "distance": "Cosine"
+            }
+        });
+        let resp = self.request(reqwest::Method::PUT, &url).json(&body).send()?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to create collection '{}': HTTP {} - {}",
+                self.collection,
+                status,
+                text
+            ));
+        }
+        eprintln!("Collection '{}' created.", self.collection);
+        Ok(())
     }
 
     /// Get chunks by file_id with optional selector (Phase 7+)
@@ -620,7 +664,7 @@ impl QdrantUploader {
                 offset: offset.clone(),
             };
 
-            let response = self.client.post(&endpoint).json(&request_body).send()?;
+            let response = self.request(reqwest::Method::POST, &endpoint).json(&request_body).send()?;
 
             if !response.status().is_success() {
                 return Err(anyhow!("Failed to scroll file chunks: HTTP {}", response.status()));
