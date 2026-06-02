@@ -58,7 +58,12 @@ pub fn should_skip_path(path: &str) -> bool {
     }
 
     // Skip Claude Code worktrees (ephemeral clones that confuse Qdrant indexing)
-    if path.contains("/.claude/worktrees/") {
+    if path.contains("/.claude/worktrees/") || path.contains("\\.claude\\worktrees\\") {
+        return true;
+    }
+
+    // Skip Python virtual environments
+    if path.contains("/.venv/") || path.contains("\\.venv\\") {
         return true;
     }
 
