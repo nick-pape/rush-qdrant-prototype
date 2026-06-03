@@ -22,10 +22,11 @@ pub fn run_incremental_crawl(
     catalog_name: &str,
     catalog_config: &CatalogConfig,
     client: &ApiClient,
+    label: &str,
 ) -> anyhow::Result<CrawlStats> {
     let directory = &catalog_config.path;
 
-    let existing_files = client.get_catalog_files(catalog_name)?;
+    let existing_files = client.get_catalog_files(catalog_name, Some(label))?;
 
     let mut files_to_process: Vec<(String, String)> = Vec::new();
     for entry in walkdir::WalkDir::new(directory)
@@ -94,7 +95,7 @@ pub fn run_incremental_crawl(
                         c
                     })
                     .collect();
-                match client.ingest(&chunks) {
+                match client.ingest(&chunks, label) {
                     Ok(n) => total_ingested += n,
                     Err(e) => {
                         eprintln!(
@@ -134,6 +135,7 @@ pub fn start_watcher(
     catalog_name: String,
     catalog_config: CatalogConfig,
     client: std::sync::Arc<ApiClient>,
+    label: String,
 ) {
     let watch_path = catalog_config.path.clone();
 
@@ -189,7 +191,7 @@ pub fn start_watcher(
             if has_pending && quiet_since.elapsed() >= Duration::from_secs(2) {
                 eprintln!("[{}] Changes detected in '{}', re-indexing...", chrono_timestamp(), catalog_name);
 
-                match run_incremental_crawl(&catalog_name, &catalog_config, &client) {
+                match run_incremental_crawl(&catalog_name, &catalog_config, &client, &label) {
                     Ok(stats) => {
                         let total = stats.new_files + stats.changed_files + stats.deleted_files;
                         if total > 0 {

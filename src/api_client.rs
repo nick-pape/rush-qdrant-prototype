@@ -14,6 +14,7 @@ pub struct ApiClient {
 #[derive(Serialize)]
 struct IngestRequest<'a> {
     catalog: &'a str,
+    label: &'a str,
     file_id: &'a str,
     relative_path: &'a str,
     content_hash: &'a str,
@@ -43,6 +44,8 @@ struct SearchRequest<'a> {
     limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     catalog: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -115,11 +118,13 @@ impl ApiClient {
         query: &str,
         limit: usize,
         catalog: Option<&str>,
+        label: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
         let body = SearchRequest {
             query,
             limit,
             catalog,
+            label,
         };
         let resp = self
             .request(reqwest::Method::POST, "/v1/search")
@@ -154,7 +159,7 @@ impl ApiClient {
         Ok(resp.json()?)
     }
 
-    pub fn ingest(&self, chunks: &[crate::engine::Chunk]) -> Result<usize> {
+    pub fn ingest(&self, chunks: &[crate::engine::Chunk], label: &str) -> Result<usize> {
         if chunks.is_empty() {
             return Ok(0);
         }
@@ -162,6 +167,7 @@ impl ApiClient {
         let first = &chunks[0];
         let body = IngestRequest {
             catalog: &first.catalog,
+            label,
             file_id: &crate::engine::util::display_file_id(first.file_id),
             relative_path: &first.relative_path,
             content_hash: &first.content_hash,
@@ -214,8 +220,11 @@ impl ApiClient {
         Ok(())
     }
 
-    pub fn get_catalog_files(&self, catalog: &str) -> Result<HashMap<String, FileSyncInfo>> {
-        let path = format!("/v1/files/{}", urlencoding::encode(catalog));
+    pub fn get_catalog_files(&self, catalog: &str, label: Option<&str>) -> Result<HashMap<String, FileSyncInfo>> {
+        let mut path = format!("/v1/files/{}", urlencoding::encode(catalog));
+        if let Some(l) = label {
+            path.push_str(&format!("?label={}", urlencoding::encode(l)));
+        }
         let resp = self.request(reqwest::Method::GET, &path).send()?;
         if !resp.status().is_success() {
             return Err(anyhow!("Get files failed: HTTP {}", resp.status()));

@@ -119,6 +119,7 @@ fn handle_search(
     id: Option<serde_json::Value>,
     args: &serde_json::Value,
     client: &ApiClient,
+    label: &str,
 ) -> JsonRpcResponse {
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -128,7 +129,13 @@ fn handle_search(
         return error(id, -32602, "Missing required parameter: query".into());
     }
 
-    match client.search(query, limit, catalog) {
+    // Search current branch, fall back to main if empty
+    let mut results = client.search(query, limit, catalog, Some(label)).unwrap_or_default();
+    if results.is_empty() && label != "main" {
+        results = client.search(query, limit, catalog, Some("main")).unwrap_or_default();
+    }
+
+    match Ok::<_, anyhow::Error>(results) {
         Ok(results) => {
             let mut output = String::new();
             for r in &results {
@@ -243,7 +250,7 @@ fn parse_view_selector(spec: &str) -> (String, Option<usize>, Option<usize>) {
     }
 }
 
-pub fn run_stdio(client: &ApiClient, catalogs: &[String]) {
+pub fn run_stdio(client: &ApiClient, catalogs: &[String], label: &str) {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -281,7 +288,7 @@ pub fn run_stdio(client: &ApiClient, catalogs: &[String]) {
                     .unwrap_or(serde_json::json!({}));
 
                 match tool {
-                    "semantic_search" => handle_search(req.id, &args, client),
+                    "semantic_search" => handle_search(req.id, &args, client, label),
                     "view_chunks" => handle_view(req.id, &args, client),
                     _ => error(req.id, -32601, format!("Unknown tool: {}", tool)),
                 }

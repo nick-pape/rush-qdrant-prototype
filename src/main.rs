@@ -91,6 +91,19 @@ fn get_api_token() -> anyhow::Result<String> {
     ))
 }
 
+fn current_branch(path: &str) -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(path)
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() || s == "HEAD" { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| "main".to_string())
+}
+
 fn detect_catalog_type(path: &str) -> String {
     if std::path::Path::new(path).join("rush.json").exists() {
         "monorepo".to_string()
@@ -152,10 +165,11 @@ fn main() -> anyhow::Result<()> {
             let resolved_type = if r#type == "auto" { detect_catalog_type(&path) } else { r#type };
             let abs_path = std::fs::canonicalize(&path)?.to_string_lossy().to_string();
             let catalog_name = catalog_name_from_path(&abs_path);
-            let config = CatalogConfig { r#type: resolved_type, path: abs_path };
+            let config = CatalogConfig { r#type: resolved_type, path: abs_path.clone() };
+            let label = current_branch(&abs_path);
 
-            eprintln!("Crawling '{}' as catalog '{}'...", config.path, catalog_name);
-            let stats = watcher::run_incremental_crawl(&catalog_name, &config, &api)?;
+            eprintln!("Crawling '{}' as catalog '{}' (branch: {})...", config.path, catalog_name, label);
+            let stats = watcher::run_incremental_crawl(&catalog_name, &config, &api, &label)?;
             eprintln!(
                 "Done: {} new, {} changed, {} unchanged, {} deleted ({} chunks ingested)",
                 stats.new_files, stats.changed_files, stats.unchanged_files,
@@ -178,22 +192,22 @@ fn main() -> anyhow::Result<()> {
 
             let mut catalogs: Vec<String> = Vec::new();
 
-            if let Some(watch_path) = cli.watch {
+            if let Some(ref watch_path) = cli.watch {
                 let abs_path = std::fs::canonicalize(&watch_path)?.to_string_lossy().to_string();
                 let resolved_type = if cli.r#type == "auto" { detect_catalog_type(&abs_path) } else { cli.r#type };
                 let catalog_name = catalog_name_from_path(&abs_path);
                 let config = CatalogConfig { r#type: resolved_type, path: abs_path.clone() };
 
+                let label = current_branch(&abs_path);
                 catalogs.push(catalog_name.clone());
 
-                // Initial crawl + watcher on a background thread so stdio
-                // is responsive immediately (Claude Code times out at 30s).
                 let bg_api = api.clone();
                 let bg_name = catalog_name.clone();
                 let bg_config = config.clone();
+                let bg_label = label.clone();
                 std::thread::spawn(move || {
-                    eprintln!("Initial index for '{}'...", bg_name);
-                    match watcher::run_incremental_crawl(&bg_name, &bg_config, &bg_api) {
+                    eprintln!("Initial index for '{}' (branch: {})...", bg_name, bg_label);
+                    match watcher::run_incremental_crawl(&bg_name, &bg_config, &bg_api, &bg_label) {
                         Ok(stats) => {
                             eprintln!(
                                 "  {} new, {} changed, {} unchanged, {} deleted ({} chunks)",
@@ -203,11 +217,17 @@ fn main() -> anyhow::Result<()> {
                         }
                         Err(e) => eprintln!("  Warning: initial crawl failed: {}", e),
                     }
-                    watcher::start_watcher(bg_name, bg_config, bg_api);
+                    watcher::start_watcher(bg_name, bg_config, bg_api, bg_label);
                 });
             }
 
-            stdio::run_stdio(&api, &catalogs);
+            let active_label = if let Some(ref wp) = cli.watch {
+                let abs = std::fs::canonicalize(wp).unwrap_or_default();
+                current_branch(&abs.to_string_lossy())
+            } else {
+                "main".to_string()
+            };
+            stdio::run_stdio(&api, &catalogs, &active_label);
         }
     }
 
